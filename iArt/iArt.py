@@ -1,16 +1,17 @@
+# Description: This file contains the implementation of the Imputation-Assisted Randomization Tests (iArt) 
 import pandas as pd
 import numpy as np
 from statsmodels.stats.multitest import multipletests
 from sklearn.base import clone
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
+from sklearn.exceptions import DataConversionWarning
 from sklearn.exceptions import ConvergenceWarning
 from sklearn import linear_model
 import lightgbm as lgb
 import xgboost as xgb
 from sklearn.impute import SimpleImputer
 import time
-from sklearn.exceptions import DataConversionWarning
 import warnings
 
 def holm_bonferroni(p_values, alpha = 0.05):
@@ -26,14 +27,12 @@ def holm_bonferroni(p_values, alpha = 0.05):
 
     return any_rejected
 
-def getY(G, Z, X,Y, covariate_adjustment = False):
+def getY(G, Z, X,Y, covariate_adjustment = 0):
     """
     Calculate the imputed Y values using G and df_Z
     if covariate_adjustment is True, return the adjusted Y values based on predicted Y values and X
     else return the predicted Y values
     """
-    if covariate_adjustment:
-        G_adjusted = clone(G)
     df_Z = pd.DataFrame(np.concatenate((Z, X, Y), axis=1))
     # lenY is the number of how many columns are Y
     lenY = Y.shape[1]
@@ -44,15 +43,60 @@ def getY(G, Z, X,Y, covariate_adjustment = False):
 
     Y_head = df_imputed[:, indexY:indexY+lenY]
     X = df_imputed[:, 1:1+X.shape[1]]
-    if covariate_adjustment:
+    
+    if covariate_adjustment == 0:
+        return Y_head
+    
+    # suppress the warnings
+    warnings.filterwarnings('ignore', category=ConvergenceWarning)
+
+    if covariate_adjustment == 1:
         warnings.filterwarnings(action='ignore', category=DataConversionWarning)
         # use linear regression to adjust the predicted Y values based on X
-        lm = linear_model.LinearRegression()
-        lm.fit(X, Y_head)
-        Y_head_adjusted = lm.predict(X)
-        return Y_head - Y_head_adjusted
-    else:
-        return Y_head
+        Y_head_adjusted = np.zeros_like(Y_head)
+        for i in range(lenY):
+            # Extract the current target predictions
+            Y_current = Y_head[:, i]
+
+            # Fit the model to current target
+            lm = linear_model.BayesianRidge()
+            lm.fit(X, Y_current)
+
+            # Predict and adjust for the current target
+            Y_current_adjusted = lm.predict(X)
+            Y_head_adjusted[:, i] = Y_current - Y_current_adjusted
+
+        return Y_head_adjusted
+    
+    if covariate_adjustment == 2:
+        warnings.filterwarnings(action='ignore', category=DataConversionWarning)
+        # use xgboost to adjust the predicted Y values based on X
+        Y_head_adjusted = np.zeros_like(Y_head)
+        for i in range(lenY):
+            # Extract the current target predictions
+            Y_current = Y_head[:, i]
+
+            xg = xgb.XGBRegressor()
+            xg.fit(X, Y_current)
+            Y_current_adjusted = xg.predict(X)
+            Y_head_adjusted[:, i] = Y_current - Y_current_adjusted
+
+        return Y_head_adjusted
+    
+    if covariate_adjustment == 3:
+        warnings.filterwarnings(action='ignore', category=DataConversionWarning)
+        # use lightgbm to adjust the predicted Y values based on X
+        Y_head_adjusted = np.zeros_like(Y_head)
+        for i in range(lenY):
+            # Extract the current target predictions
+            Y_current = Y_head[:, i]
+
+            lgbm = lgb.LGBMRegressor()
+            lgbm.fit(X, Y_current)
+            Y_current_adjusted = lgbm.predict(X)
+            Y_head_adjusted[:, i] = Y_current - Y_current_adjusted
+        
+        return Y_head_adjusted
 
 def T(z,y):
     """
@@ -129,13 +173,13 @@ def getZsim(Z_sim_templates):
     """ 
     Shuffle each Z_sim template and concatenate them into a single permutated Z_sim array 
     """
-
     Z_sim = []
     for Z_sim_template in Z_sim_templates:
         strata_Z_sim = np.array(Z_sim_template.copy())
         np.random.shuffle(strata_Z_sim)
         Z_sim.append(strata_Z_sim)
     Z_sim = np.concatenate(Z_sim).reshape(-1, 1)
+
     return Z_sim
 
 def preprocess(Z, X, Y, S):
@@ -149,16 +193,18 @@ def preprocess(Z, X, Y, S):
     Y = np.array(Y)
     X = X.reshape(-1, X.shape[1])
     Z = Z.reshape(-1, 1)
-    if S == None:
-        S = np.ones(Z.shape)
+
+    if S is None:
+        S = np.ones(Z.shape).reshape(-1, 1)
         M = np.isnan(Y).reshape(-1, Y.shape[1])
         return Z, X, Y, S, M
+    
     S = np.array(S)
     S = S.reshape(-1, 1)
 
     # Concatenate Z, X, Y, S, and M into a single DataFrame
     df = pd.DataFrame(np.concatenate((Z, X, Y, S), axis=1))
-
+    
     # Sort the DataFrame based on S (assuming S is the column before M)
     df = df.sort_values(by=df.columns[-1])
 
@@ -172,7 +218,7 @@ def preprocess(Z, X, Y, S):
     return Z, X, Y, S, M
 
 
-def check_param(Z, X, Y, S, G, L, verbose, covariate_adjustment,alpha,alternative,random_state):
+def check_param(*,Z, X, Y, S, G, L,mode, verbose, covariate_adjustment,alpha,alternative,random_state):
     """
     Check the validity of the input parameters
     """
@@ -210,16 +256,21 @@ def check_param(Z, X, Y, S, G, L, verbose, covariate_adjustment,alpha,alternativ
         raise ValueError("G cannot be None")
     
     # Check covariate_adjustment: must be True or False
-    if covariate_adjustment not in [True, False, 1, 0]:
-        raise ValueError("covariate_adjustment must be True or False")
+    if covariate_adjustment not in [0, 1, 2, 3]:
+        raise ValueError("covariate_adjustment must be one of 0, 1, 2, 3")
 
     # Check alternative: must be one of "greater", "less" or "two-sided" 
     if alternative not in ["greater", "less", "two-sided"]:
         raise ValueError("alternative must be one of greater, less or two-sided")
     
     # Check random_state: must be an integer greater than 0 or None
-    if random_state != None and (not isinstance(random_state, int) or random_state <= 0):
-        raise ValueError("random_state must be an integer greater than 0 or None")
+    if random_state != None and (not isinstance(random_state, int) or random_state < 0):
+        raise ValueError("random_state must be an integer >= 0 or None")
+    
+    # Check mode: must be one of "strata" or "cluster"
+    if mode not in ["strata", "cluster"]:
+        raise ValueError("mode must be one of strata or cluster")
+    
     
 def choosemodel(G):
     """ 
@@ -234,7 +285,7 @@ def choosemodel(G):
         warnings.filterwarnings('ignore', category=ConvergenceWarning)
         if G == 'xgboost':
             G = IterativeImputer(estimator = xgb.XGBRegressor(), max_iter = 1)
-        if G == 'bayesianridge':
+        if G == 'linear':
             G = IterativeImputer(estimator = linear_model.BayesianRidge(), max_iter = 1,verbose=0)
         if G == 'median':
             G = SimpleImputer(missing_values=np.nan, strategy='median')
@@ -242,11 +293,11 @@ def choosemodel(G):
             G = SimpleImputer(missing_values=np.nan, strategy='mean')
         if G == 'lightgbm':
             G = IterativeImputer(estimator = lgb.LGBMRegressor(verbosity = -1), max_iter = 1)
-        if G == 'mice':
+        if G == 'iterative+linear':
             G = IterativeImputer(estimator = linear_model.BayesianRidge())
-        if G == 'mice+lightgbm':
+        if G == 'iterative+lightgbm':
             G = IterativeImputer(estimator = lgb.LGBMRegressor(verbosity = -1))
-        if G == 'mice+xgboost':
+        if G == 'iterative+xgboost':
             G = IterativeImputer(estimator = xgb.XGBRegressor())
     return G
 
@@ -280,7 +331,7 @@ def transformX(X, threshold=0.1, verbose=True):
     
     # Columns that are not imputed
     not_imputed_columns = [col for col in range(X.shape[1]) if col not in imputed_columns]
-    
+
     if verbose:
         print(f"Missing Rate Before Imputation for X: {missing_rate * 100}")
         
@@ -288,10 +339,10 @@ def transformX(X, threshold=0.1, verbose=True):
             print(f"Missing Rate After Imputation for X: {missing_rate_after * 100}")
             print(f"Columns Imputed for X: {imputed_columns}")
         print(f"Columns Not Imputed for X: {not_imputed_columns}")
-
+    
     return X
 
-def test(*,Z, X, Y, G='bayesianridge', S=None,L = 10000,threshholdForX = 0.1,verbose = False, covariate_adjustment = False, random_state=None, alternative = "greater", alpha = 0.05):
+def test(*,Z, X, Y, G='bayesianridge', S=None,L = 10000,threshholdForX = 0.2, mode = 'strata',verbose = False, covariate_adjustment = 0, random_state=None, alternative = "greater", alpha = 0.05):
     """Imputation-Assisted Randomization Tests (iArt) for testing 
     the null hypothesis that the treatment has no effect on the outcome.
 
@@ -316,11 +367,17 @@ def test(*,Z, X, Y, G='bayesianridge', S=None,L = 10000,threshholdForX = 0.1,ver
     L : int, default: 10000
         The number of Monte Carlo simulations 
 
+    mode : {'strata','cluster'}, default: 'strata'
+        A string indicating the randomization mode
+
     verbose : bool, default: False
         A boolean indicating whether to print training start and end 
 
-    covarite_adjustment : bool, default: False
-        A boolean indicating whether to do covariate adjustment ()
+    covarite_adjustment : int, default: 0
+        if 0, covariate adjustment is not used
+        if 1, ridge covariate adjustment is used
+        if 2, xgboost covariate adjustment is used
+        if 3, lightgbm covariate adjustment is used
 
     random_state : {None, int, `numpy.random.Generator`,`numpy.random.RandomState`}, default: None
         If `seed` is None (or `np.random`), the `numpy.random.RandomState`
@@ -351,8 +408,8 @@ def test(*,Z, X, Y, G='bayesianridge', S=None,L = 10000,threshholdForX = 0.1,ver
     X = transformX(X,threshholdForX,verbose)
 
     # Check the validity of the input parameters
-    check_param(Z, X, Y, S, G, L, verbose,covariate_adjustment,alpha,alternative,random_state)
-
+    check_param(Z=Z, X=X, Y=Y, S=S, G=G, L=L, mode=mode, verbose=verbose, covariate_adjustment=covariate_adjustment, alpha=alpha, alternative=alternative, random_state=random_state)
+    
     # Set random seed
     np.random.seed(random_state)
 
@@ -379,12 +436,26 @@ def test(*,Z, X, Y, G='bayesianridge', S=None,L = 10000,threshholdForX = 0.1,ver
 
     # re-impute the missing values and calculate the observed test statistics in part 2
     t_sim = [ [] for _ in range(L)]
-    Z_sim_templates = getZsimTemplates(Z, S)
+    if mode == 'strata':
+        Z_sim_templates = getZsimTemplates(Z, S)
+    else:
+        p = 0.5
+        cluster_indices = np.unique(S)
+        num_clusters = len(cluster_indices)
+        cluster_sim_template = np.array([0.0] * int(num_clusters * p) + [1.0] * (num_clusters - int(num_clusters * p)))
 
     for l in range(L):
         
         # simulate treatment indicators
-        Z_sim = getZsim(Z_sim_templates)
+        if mode == 'strata':
+            Z_sim = getZsim(Z_sim_templates)
+        else:
+            cluster_sim = cluster_sim_template.copy()
+            np.random.shuffle(cluster_sim)
+            Z_sim = []
+            for s in S.flatten():
+                Z_sim.append(cluster_sim[int(s) - 1])
+            Z_sim = np.array(Z_sim).reshape(-1, 1)
 
         # impute the missing values and get the predicted Y values        
         Y_pred = getY(clone(G_model), Z_sim, X, Y, covariate_adjustment)
