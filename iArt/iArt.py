@@ -165,7 +165,7 @@ def getZsimTemplates(Z_sorted, S):
         strata_Z = Z_sorted[strata_indices]
         p = np.mean(strata_Z)
         strata_size = len(strata_indices)
-        Z_sim_template = [0.0] * int(strata_size * (1 - p)) + [1.0] * int(strata_size * p)
+        Z_sim_template = [0.0] * int(strata_size * (1 - p)) + [1.0] * (strata_size -int(strata_size * (1 - p)) )
         Z_sim_templates.append(Z_sim_template)
     return Z_sim_templates
 
